@@ -293,8 +293,10 @@ class StreamingSeries:
 
 @dataclass
 class WindowResults:
-    summary: WindowMetrics
+    summary: Optional[WindowMetrics]
     timeline: StreamingSeries
+    timeline_nodp: Optional[StreamingSeries] = None
+    summary_nodp: Optional[WindowMetrics] = None
 
 def predict_linear_value(weights: List[float], features: List[float]) -> float:
     return weights[0] + sum(w * x for w, x in zip(weights[1:], features))
@@ -409,10 +411,7 @@ def evaluate_single_hour_regression(
     l2 = config.get("l2", 1e-3)
     horizon = max(0, int(config.get("horizon", 0)))
     lag_steps_cfg = config.get("lag_steps", (1, 2))
-    if isinstance(lag_steps_cfg, int):
-        lag_steps = [lag_steps_cfg]
-    else:
-        lag_steps = [int(x) for x in lag_steps_cfg]
+    lag_steps = [lag_steps_cfg] if isinstance(lag_steps_cfg, int) else [int(x) for x in lag_steps_cfg]
     lag_steps = sorted({lag for lag in lag_steps if lag > 0})
     dow_mod7 = bool(config.get("dow_mod7", False))
     dow_offset = int(config.get("dow_offset", 0)) % 7
@@ -451,32 +450,305 @@ def evaluate_single_hour_regression(
 
     points_per_day = max(1, int(round(60.0 / sample_step))) if sample_step > 0 else 1
     count_feature_len = 1 + len(lag_steps)
+    feature_scale = float(max_available)
+    target_scale = float(max_available)
+
+    def normalize_rows(rows: List[List[float]]) -> List[List[float]]:
+        return [
+            [(val / feature_scale) if idx < count_feature_len else val for idx, val in enumerate(row)]
+            for row in rows
+        ]
+
+    def build_feature_rows(means: List[Optional[float]]) -> Tuple[List[List[float]], List[float], List[int]]:
+        feature_rows: List[List[float]] = []
+        targets: List[float] = []
+        indices: List[int] = []
+        for idx, value in enumerate(means):
+            if value is None:
+                continue
+            features = [float(value)]
+            feasible = True
+            for lag in lag_steps:
+                lag_idx = idx - lag
+                if lag_idx < 0:
+                    feasible = False
+                    break
+                lag_value = means[lag_idx]
+                if lag_value is None:
+                    feasible = False
+                    break
+                features.append(float(lag_value))
+            if not feasible:
+                continue
+            if dow_mod7:
+                day_idx = idx // points_per_day
+                dow = (dow_offset + day_idx) % 7
+                features.extend(
+                    [
+                        math.sin(2.0 * math.pi * dow / 7.0),
+                        math.cos(2.0 * math.pi * dow / 7.0),
+                        1.0 if dow in (5, 6) else 0.0,
+                    ]
+                )
+            if minute_cyc:
+                minute_position = (idx * sample_step) % 60.0
+                features.extend(
+                    [
+                        math.sin(2.0 * math.pi * minute_position / 60.0),
+                        math.cos(2.0 * math.pi * minute_position / 60.0),
+                    ]
+                )
+            feature_rows.append(features)
+            targets.append(float(counts_by_step[idx]))
+            indices.append(idx)
+        return feature_rows, targets, indices
+
+    def split_train_test(feature_rows: List[List[float]], targets: List[float]) -> Tuple[List[List[float]], List[List[float]], List[float], List[float], int]:
+        total = len(feature_rows)
+        split = max(1, min(total - 1, int(total * train_ratio)))
+        return (
+            feature_rows[:split],
+            feature_rows[split:],
+            targets[:split],
+            targets[split:],
+            split,
+        )
+
+    def train_and_predict(train_rows: List[List[float]], test_rows: List[List[float]], train_targets: List[float]) -> List[float]:
+        if not test_rows:
+            return []
+        weights = train_ridge_regression(
+            normalize_rows(train_rows),
+            [value / target_scale for value in train_targets],
+            l2=l2,
+        )
+        preds: List[float] = []
+        for feats in normalize_rows(test_rows):
+            raw_pred = predict_linear_value(weights, feats) * target_scale
+            preds.append(max(0.0, min(float(max_available), raw_pred)))
+        return preds
+
+    def compute_baselines(
+        train_targets: List[float],
+        test_targets: List[float],
+        test_indices: List[int],
+        means: List[Optional[float]],
+    ) -> Dict[str, float]:
+        baseline_mean = sum(train_targets) / len(train_targets)
+        baseline_mean_preds = [baseline_mean] * len(test_targets)
+        locf_preds: List[float] = []
+        step = max(1, horizon)
+        for idx in test_indices:
+            prev_idx = idx - step
+            locf_preds.append(baseline_mean if prev_idx < 0 else float(counts_by_step[prev_idx]))
+        mean_preds: List[float] = []
+        for idx in test_indices:
+            value_opt = means[idx]
+            if value_opt is None:
+                mean_preds = baseline_mean_preds[:]
+                break
+            mean_preds.append(float(value_opt))
+        if not mean_preds:
+            mean_preds = baseline_mean_preds[:]
+        return {
+            "baseline_mean_rmse": rmse(baseline_mean_preds, test_targets),
+            "baseline_mean_mae": mean_absolute_error(baseline_mean_preds, test_targets),
+            "baseline_mean_r2": r2_score(baseline_mean_preds, test_targets),
+            "baseline_locf_rmse": rmse(locf_preds, test_targets),
+            "baseline_locf_mae": mean_absolute_error(locf_preds, test_targets),
+            "baseline_locf_r2": r2_score(locf_preds, test_targets),
+            "baseline_dp_rmse": rmse(mean_preds, test_targets),
+            "baseline_dp_mae": mean_absolute_error(mean_preds, test_targets),
+            "baseline_dp_r2": r2_score(mean_preds, test_targets),
+        }
+
+    def update_per_step(buffers: Dict[str, Any], window: int, preds: List[float], test_indices: List[int], test_targets: List[float]) -> None:
+        data = buffers["per_step"][window]
+        for idx, pred, target in zip(test_indices, preds, test_targets):
+            error = pred - target
+            data["pred"][idx] += pred
+            data["abs"][idx] += abs(error)
+            data["sq"][idx] += error ** 2
+            data["bias"][idx] += error
+            data["count"][idx] += 1
+
+    def build_timeline(data: Dict[str, List[float]]) -> StreamingSeries:
+        avg_prediction: List[float] = []
+        mean_abs_error: List[float] = []
+        cumulative_rmse: List[float] = []
+        cumulative_mae: List[float] = []
+        cumulative_bias: List[float] = []
+        cum_sq = 0.0
+        cum_abs = 0.0
+        cum_bias_total = 0.0
+        cum_total = 0
+        for idx in range(n):
+            count = data["count"][idx]
+            if count > 0:
+                avg_prediction.append(data["pred"][idx] / count)
+                mean_abs_error.append(data["abs"][idx] / count)
+                cum_sq += data["sq"][idx]
+                cum_abs += data["abs"][idx]
+                cum_bias_total += data["bias"][idx]
+                cum_total += count
+            else:
+                avg_prediction.append(float("nan"))
+                mean_abs_error.append(float("nan"))
+            cumulative_rmse.append(math.sqrt(cum_sq / cum_total) if cum_total > 0 else float("nan"))
+            cumulative_mae.append(cum_abs / cum_total if cum_total > 0 else float("nan"))
+            cumulative_bias.append(cum_bias_total / cum_total if cum_total > 0 else float("nan"))
+        return StreamingSeries(
+            avg_prediction=avg_prediction,
+            mean_absolute_error=mean_abs_error,
+            cumulative_rmse=cumulative_rmse,
+            cumulative_mae=cumulative_mae,
+            cumulative_bias=cumulative_bias,
+        )
+
+    metric_names = [
+        "rmse",
+        "mae",
+        "bias",
+        "r2",
+        "baseline_mean_rmse",
+        "baseline_mean_mae",
+        "baseline_mean_r2",
+        "baseline_locf_rmse",
+        "baseline_locf_mae",
+        "baseline_locf_r2",
+        "baseline_dp_rmse",
+        "baseline_dp_mae",
+        "baseline_dp_r2",
+    ]
+
+    def init_metrics() -> Dict[str, Dict[int, List[float]]]:
+        return {name: {window: [] for window in window_grid} for name in metric_names}
+
+    def init_counts() -> Dict[int, Optional[int]]:
+        return {window: None for window in window_grid}
+
+    def init_per_step() -> Dict[int, Dict[str, List[float]]]:
+        return {
+            window: {
+                "pred": [0.0] * n,
+                "abs": [0.0] * n,
+                "sq": [0.0] * n,
+                "bias": [0.0] * n,
+                "count": [0] * n,
+            }
+            for window in window_grid
+        }
+
+    def append_metrics(buffers: Dict[str, Any], window: int, values: Dict[str, float]) -> None:
+        metrics = buffers["metrics"]
+        for name, value in values.items():
+            metrics[name][window].append(value)
+
+    def build_summary(buffers: Dict[str, Any], window: int) -> Optional[WindowMetrics]:
+        metrics = buffers["metrics"]
+        if not metrics["rmse"][window]:
+            return None
+        return WindowMetrics(
+            rmse=_mean(metrics["rmse"][window]),
+            mae=_mean(metrics["mae"][window]),
+            bias=_mean(metrics["bias"][window]),
+            r2=_mean(metrics["r2"][window]),
+            baseline_mean_rmse=_mean(metrics["baseline_mean_rmse"][window]),
+            baseline_mean_mae=_mean(metrics["baseline_mean_mae"][window]),
+            baseline_mean_r2=_mean(metrics["baseline_mean_r2"][window]),
+            baseline_locf_rmse=_mean(metrics["baseline_locf_rmse"][window]),
+            baseline_locf_mae=_mean(metrics["baseline_locf_mae"][window]),
+            baseline_locf_r2=_mean(metrics["baseline_locf_r2"][window]),
+            baseline_dp_rmse=_mean(metrics["baseline_dp_rmse"][window]),
+            baseline_dp_mae=_mean(metrics["baseline_dp_mae"][window]),
+            baseline_dp_r2=_mean(metrics["baseline_dp_r2"][window]),
+            train_count=buffers["train"][window] or 0,
+            test_count=buffers["test"][window] or 0,
+        )
+
+    def run_variant(window: int, means_by_window: Dict[int, List[Optional[float]]], buffers: Dict[str, Any]) -> bool:
+        means = means_by_window[window]
+        feature_rows, target_rows, indices = build_feature_rows(means)
+        if len(feature_rows) < 2:
+            return False
+        train_rows, test_rows, train_targets, test_targets, split_idx = split_train_test(feature_rows, target_rows)
+        if not test_rows:
+            return False
+        if buffers["train"][window] is None:
+            buffers["train"][window] = split_idx
+        if buffers["test"][window] is None:
+            buffers["test"][window] = len(test_targets)
+        preds = train_and_predict(train_rows, test_rows, train_targets)
+        if not preds:
+            return False
+        test_indices = indices[split_idx:]
+        values = {
+            "rmse": rmse(preds, test_targets),
+            "mae": mean_absolute_error(preds, test_targets),
+            "bias": (sum(p - t for p, t in zip(preds, test_targets)) / len(preds)) if preds else 0.0,
+            "r2": r2_score(preds, test_targets),
+        }
+        values.update(compute_baselines(train_targets, test_targets, test_indices, means))
+        append_metrics(buffers, window, values)
+        update_per_step(buffers, window, preds, test_indices, test_targets)
+        return True
+
+    def build_dp_prefix(stream: ContinualToeplitzStream) -> List[float]:
+        prefix = [0.0] * n
+        if n > 1:
+            for idx in range(1, n):
+                if idx % max(1, n // 5) == 0 or idx == n - 1:
+                    print(f"    Prefetching DP prefix {idx}/{n - 1}", flush=True)
+                prefix[idx] = stream.fetch_privacy_preserving_sub_interval_sum(1, idx)
+        return prefix
+
+    def build_exact_prefix() -> List[float]:
+        prefix = [0.0] * n
+        running = 0.0
+        if n > 1:
+            for idx in range(1, n):
+                running += float(counts_by_step[idx - 1])
+                prefix[idx] = running
+        return prefix
+
+    def means_from_prefix(prefix: List[float], show_progress: bool) -> Dict[int, List[Optional[float]]]:
+        means_by_window: Dict[int, List[Optional[float]]] = {}
+        total_windows = len(window_grid)
+        for win_idx, window in enumerate(window_grid, start=1):
+            if show_progress:
+                if win_idx == 1:
+                    print(f"    Window {window} (1/{total_windows})", flush=True)
+                elif win_idx % max(1, total_windows // 3) == 0 or win_idx == total_windows:
+                    print(f"    Window {window} ({win_idx}/{total_windows})", flush=True)
+            means: List[Optional[float]] = [None] * n
+            start_t = window + horizon
+            if start_t >= n:
+                means_by_window[window] = means
+                continue
+            for t in range(start_t, n):
+                if show_progress and (t % max(1, n // 5) == 0 or t == n - 1):
+                    print(f"      Window {window}: processed {t}/{n} timesteps", flush=True)
+                end_time = t - horizon
+                start_idx = end_time - window + 1
+                if start_idx < 1:
+                    continue
+                window_sum = prefix[end_time] - prefix[start_idx - 1]
+                mean_val = window_sum / float(window)
+                means[t] = max(0.0, min(float(max_available), mean_val))
+            means_by_window[window] = means
+        return means_by_window
+
+    print(
+        f"Prepared {n} samples (step={sample_step}, max={max_samples or '∞'})",
+        flush=True,
+    )
 
     for eps_idx, eps in enumerate(epsilons, start=1):
         if eps <= 0:
             continue
 
-        rmse_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        mae_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        bias_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        r2_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_mean_rmse_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_mean_mae_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_mean_r2_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_locf_rmse_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_locf_mae_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_locf_r2_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_dp_rmse_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_dp_mae_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        baseline_dp_r2_vals: Dict[int, List[float]] = {window: [] for window in window_grid}
-        train_counts: Dict[int, Optional[int]] = {window: None for window in window_grid}
-        test_counts: Dict[int, Optional[int]] = {window: None for window in window_grid}
-
-        per_step_pred_sums: Dict[int, List[float]] = {window: [0.0] * n for window in window_grid}
-        per_step_abs_error_sums: Dict[int, List[float]] = {window: [0.0] * n for window in window_grid}
-        per_step_sq_error_sums: Dict[int, List[float]] = {window: [0.0] * n for window in window_grid}
-        per_step_bias_sums: Dict[int, List[float]] = {window: [0.0] * n for window in window_grid}
-        per_step_counts: Dict[int, List[int]] = {window: [0] * n for window in window_grid}
+        variant_dp = {"metrics": init_metrics(), "train": init_counts(), "test": init_counts(), "per_step": init_per_step()}
+        variant_nodp = {"metrics": init_metrics(), "train": init_counts(), "test": init_counts(), "per_step": init_per_step()}
 
         print(f"Evaluating epsilon {eps} ({eps_idx}/{len(epsilons)})", flush=True)
         for trial in range(trials):
@@ -488,281 +760,36 @@ def evaluate_single_hour_regression(
             for value in counts_by_step:
                 stream.append_count_on_new_timestamp(value)
             elapsed_stream = time.perf_counter() - start_time
-            print(
-                f"    Stream ready (steps={n}) in {elapsed_stream:.2f}s",
-                flush=True,
-            )
+            print(f"    Stream ready (steps={n}) in {elapsed_stream:.2f}s", flush=True)
 
             try:
-                dp_prefix: List[float] = [0.0] * n
-                if n > 1:
-                    for prefix_idx in range(1, n):
-                        if prefix_idx % max(1, n // 5) == 0 or prefix_idx == n - 1:
-                            print(
-                                f"    Prefetching DP prefix {prefix_idx}/{n - 1}",
-                                flush=True,
-                            )
-                        dp_prefix[prefix_idx] = stream.fetch_privacy_preserving_sub_interval_sum(1, prefix_idx)
-
-                dp_means_by_window: Dict[int, List[Optional[float]]] = {}
-                for win_idx, window in enumerate(window_grid, start=1):
-                    if win_idx == 1:
-                        print(f"    Window {window} (1/{len(window_grid)})", flush=True)
-                    elif win_idx % max(1, len(window_grid) // 3) == 0 or win_idx == len(window_grid):
-                        print(f"    Window {window} ({win_idx}/{len(window_grid)})", flush=True)
-                    dp_means: List[Optional[float]] = [None] * n
-                    start_t = window + horizon
-                    if start_t >= n:
-                        dp_means_by_window[window] = dp_means
-                        continue
-                    for t in range(start_t, n):
-                        end_time = t - horizon
-                        if t % max(1, n // 5) == 0 or t == n - 1:
-                            print(
-                                f"      Window {window}: processed {t}/{n} timesteps",
-                                flush=True,
-                            )
-                        start_idx = end_time - window + 1
-                        if start_idx < 1:
-                            continue
-                        window_sum = dp_prefix[end_time] - dp_prefix[start_idx - 1]
-                        dp_mean = window_sum / float(window)
-                        dp_means[t] = max(0.0, min(float(max_available), dp_mean))
-                    dp_means_by_window[window] = dp_means
-
-                feature_scale = float(max_available)
-                target_scale = float(max_available)
-
+                dp_prefix = build_dp_prefix(stream)
+                dp_means_by_window = means_from_prefix(dp_prefix, show_progress=True)
+                exact_prefix = build_exact_prefix()
+                exact_means_by_window = means_from_prefix(exact_prefix, show_progress=False)
                 for window in window_grid:
-                    dp_means = dp_means_by_window[window]
-                    feature_rows_raw: List[List[float]] = []
-                    target_rows_raw: List[float] = []
-                    indices: List[int] = []
-                    for idx in range(n):
-                        value_opt = dp_means[idx]
-                        if value_opt is None:
-                            continue
-                        features = [float(value_opt)]
-                        feasible = True
-                        for lag in lag_steps:
-                            lag_idx = idx - lag
-                            if lag_idx < 0:
-                                feasible = False
-                                break
-                            lag_value_opt = dp_means[lag_idx]
-                            if lag_value_opt is None:
-                                feasible = False
-                                break
-                            features.append(float(lag_value_opt))
-                        if not feasible:
-                            continue
-                        if dow_mod7:
-                            day_idx = idx // points_per_day
-                            dow = (dow_offset + day_idx) % 7
-                            features.extend(
-                                [
-                                    math.sin(2.0 * math.pi * dow / 7.0),
-                                    math.cos(2.0 * math.pi * dow / 7.0),
-                                    1.0 if dow in (5, 6) else 0.0,
-                                ]
-                            )
-                        if minute_cyc:
-                            minute_position = (idx * sample_step) % 60.0
-                            features.extend(
-                                [
-                                    math.sin(2.0 * math.pi * minute_position / 60.0),
-                                    math.cos(2.0 * math.pi * minute_position / 60.0),
-                                ]
-                            )
-                        feature_rows_raw.append(features)
-                        target_rows_raw.append(float(counts_by_step[idx]))
-                        indices.append(idx)
-
-                    if len(feature_rows_raw) < 2:
-                        continue
-
-                    total = len(feature_rows_raw)
-                    split = max(1, min(total - 1, int(total * train_ratio)))
-                    train_features_raw = feature_rows_raw[:split]
-                    test_features_raw = feature_rows_raw[split:]
-                    if not test_features_raw:
-                        continue
-                    train_targets_raw = target_rows_raw[:split]
-                    test_targets_raw = target_rows_raw[split:]
-                    test_indices = indices[split:]
-
-                    train_counts[window] = (
-                        split if train_counts[window] is None else train_counts[window]
-                    )
-                    test_counts[window] = (
-                        len(test_targets_raw)
-                        if test_counts[window] is None
-                        else test_counts[window]
-                    )
-
-                    def _normalize_rows(rows: List[List[float]]) -> List[List[float]]:
-                        normalized: List[List[float]] = []
-                        for row in rows:
-                            norm_row = []
-                            for idx_feat, value in enumerate(row):
-                                norm_value = value / feature_scale if idx_feat < count_feature_len else value
-                                norm_row.append(norm_value)
-                            normalized.append(norm_row)
-                        return normalized
-
-                    train_features = _normalize_rows(train_features_raw)
-                    test_features = _normalize_rows(test_features_raw)
-                    train_targets = [value / target_scale for value in train_targets_raw]
-
-                    weights = train_ridge_regression(
-                        train_features,
-                        train_targets,
-                        l2=l2,
-                    )
-
-                    preds: List[float] = []
-                    for feats in test_features:
-                        raw_pred = predict_linear_value(weights, feats) * target_scale
-                        preds.append(max(0.0, min(float(max_available), raw_pred)))
-
-                    rmse_val = rmse(preds, test_targets_raw)
-                    mae_val = mean_absolute_error(preds, test_targets_raw)
-                    bias_val = (
-                        sum(p - t for p, t in zip(preds, test_targets_raw)) / len(preds)
-                        if preds
-                        else 0.0
-                    )
-                    r2_val = r2_score(preds, test_targets_raw)
-
-                    baseline_mean = sum(train_targets_raw) / len(train_targets_raw)
-                    baseline_mean_preds = [baseline_mean] * len(test_targets_raw)
-                    baseline_mean_rmse = rmse(baseline_mean_preds, test_targets_raw)
-                    baseline_mean_mae = mean_absolute_error(baseline_mean_preds, test_targets_raw)
-                    baseline_mean_r2 = r2_score(baseline_mean_preds, test_targets_raw)
-
-                    baseline_locf_preds: List[float] = []
-                    for idx_global in test_indices:
-                        prev_idx = idx_global - max(1, horizon)
-                        if prev_idx < 0:
-                            baseline_locf_preds.append(baseline_mean)
-                        else:
-                            baseline_locf_preds.append(float(counts_by_step[prev_idx]))
-                    baseline_locf_rmse = rmse(baseline_locf_preds, test_targets_raw)
-                    baseline_locf_mae = mean_absolute_error(baseline_locf_preds, test_targets_raw)
-                    baseline_locf_r2 = r2_score(baseline_locf_preds, test_targets_raw)
-
-                    baseline_dp_preds: List[float] = []
-                    for idx_global in test_indices:
-                        value_opt = dp_means[idx_global]
-                        if value_opt is None:
-                            baseline_dp_preds = baseline_mean_preds[:]
-                            break
-                        baseline_dp_preds.append(float(value_opt))
-                    baseline_dp_rmse = rmse(baseline_dp_preds, test_targets_raw)
-                    baseline_dp_mae = mean_absolute_error(baseline_dp_preds, test_targets_raw)
-                    baseline_dp_r2 = r2_score(baseline_dp_preds, test_targets_raw)
-
-                    rmse_vals[window].append(rmse_val)
-                    mae_vals[window].append(mae_val)
-                    bias_vals[window].append(bias_val)
-                    r2_vals[window].append(r2_val)
-                    baseline_mean_rmse_vals[window].append(baseline_mean_rmse)
-                    baseline_mean_mae_vals[window].append(baseline_mean_mae)
-                    baseline_mean_r2_vals[window].append(baseline_mean_r2)
-                    baseline_locf_rmse_vals[window].append(baseline_locf_rmse)
-                    baseline_locf_mae_vals[window].append(baseline_locf_mae)
-                    baseline_locf_r2_vals[window].append(baseline_locf_r2)
-                    baseline_dp_rmse_vals[window].append(baseline_dp_rmse)
-                    baseline_dp_mae_vals[window].append(baseline_dp_mae)
-                    baseline_dp_r2_vals[window].append(baseline_dp_r2)
-
-                    for idx_global, pred_value, target_value in zip(
-                        test_indices, preds, test_targets_raw
-                    ):
-                        error = pred_value - target_value
-                        per_step_pred_sums[window][idx_global] += pred_value
-                        per_step_abs_error_sums[window][idx_global] += abs(error)
-                        per_step_sq_error_sums[window][idx_global] += error ** 2
-                        per_step_bias_sums[window][idx_global] += error
-                        per_step_counts[window][idx_global] += 1
+                    ran_dp = run_variant(window, dp_means_by_window, variant_dp)
+                    if ran_dp:
+                        run_variant(window, exact_means_by_window, variant_nodp)
             finally:
                 stream.close_toeplitz_stream()
 
         per_eps_metrics: Dict[int, WindowResults] = {}
         for window in window_grid:
-            trial_count = len(rmse_vals[window])
-            if trial_count == 0:
+            summary = build_summary(variant_dp, window)
+            summary_nodp = build_summary(variant_nodp, window)
+            if summary is None and summary_nodp is None:
                 continue
-
-            summary = WindowMetrics(
-                rmse=_mean(rmse_vals[window]),
-                mae=_mean(mae_vals[window]),
-                bias=_mean(bias_vals[window]),
-                r2=_mean(r2_vals[window]),
-                baseline_mean_rmse=_mean(baseline_mean_rmse_vals[window]),
-                baseline_mean_mae=_mean(baseline_mean_mae_vals[window]),
-                baseline_mean_r2=_mean(baseline_mean_r2_vals[window]),
-                baseline_locf_rmse=_mean(baseline_locf_rmse_vals[window]),
-                baseline_locf_mae=_mean(baseline_locf_mae_vals[window]),
-                baseline_locf_r2=_mean(baseline_locf_r2_vals[window]),
-                baseline_dp_rmse=_mean(baseline_dp_rmse_vals[window]),
-                baseline_dp_mae=_mean(baseline_dp_mae_vals[window]),
-                baseline_dp_r2=_mean(baseline_dp_r2_vals[window]),
-                train_count=train_counts[window] or 0,
-                test_count=test_counts[window] or 0,
+            timeline = build_timeline(variant_dp["per_step"][window])
+            timeline_nodp = None
+            if any(variant_nodp["per_step"][window]["count"]):
+                timeline_nodp = build_timeline(variant_nodp["per_step"][window])
+            per_eps_metrics[window] = WindowResults(
+                summary=summary,
+                timeline=timeline,
+                timeline_nodp=timeline_nodp,
+                summary_nodp=summary_nodp,
             )
-
-            avg_prediction_ts: List[float] = []
-            mean_abs_error_ts: List[float] = []
-            cumulative_rmse_ts: List[float] = []
-            cumulative_mae_ts: List[float] = []
-            cumulative_bias_ts: List[float] = []
-
-            cum_sq_error = 0.0
-            cum_abs_error = 0.0
-            cum_bias = 0.0
-            cum_total = 0
-
-            for idx in range(n):
-                count = per_step_counts[window][idx]
-                if count > 0:
-                    avg_prediction_ts.append(per_step_pred_sums[window][idx] / count)
-                    mean_abs_error_ts.append(per_step_abs_error_sums[window][idx] / count)
-                    cum_sq_error += per_step_sq_error_sums[window][idx]
-                    cum_abs_error += per_step_abs_error_sums[window][idx]
-                    cum_bias += per_step_bias_sums[window][idx]
-                    cum_total += count
-                    cumulative_rmse_ts.append(
-                        math.sqrt(cum_sq_error / cum_total) if cum_total > 0 else float("nan")
-                    )
-                    cumulative_mae_ts.append(
-                        cum_abs_error / cum_total if cum_total > 0 else float("nan")
-                    )
-                    cumulative_bias_ts.append(
-                        cum_bias / cum_total if cum_total > 0 else float("nan")
-                    )
-                else:
-                    avg_prediction_ts.append(float("nan"))
-                    mean_abs_error_ts.append(float("nan"))
-                    cumulative_rmse_ts.append(
-                        math.sqrt(cum_sq_error / cum_total) if cum_total > 0 else float("nan")
-                    )
-                    cumulative_mae_ts.append(
-                        cum_abs_error / cum_total if cum_total > 0 else float("nan")
-                    )
-                    cumulative_bias_ts.append(
-                        cum_bias / cum_total if cum_total > 0 else float("nan")
-                    )
-
-            timeline = StreamingSeries(
-                avg_prediction=avg_prediction_ts,
-                mean_absolute_error=mean_abs_error_ts,
-                cumulative_rmse=cumulative_rmse_ts,
-                cumulative_mae=cumulative_mae_ts,
-                cumulative_bias=cumulative_bias_ts,
-            )
-
-            per_eps_metrics[window] = WindowResults(summary=summary, timeline=timeline)
 
         if per_eps_metrics:
             results[eps] = per_eps_metrics
@@ -822,21 +849,41 @@ def print_single_hour_summary(
     if not results:
         print("No results (insufficient samples for the selected hour).")
         return
-    print(
+    header = (
         "epsilon | window | scale | train | test |    rmse |   mae |  bias |   r2 | mean_rmse | locf_rmse |  dp_rmse"
     )
-    for eps in sorted(results.keys()):
-        metrics_by_window = results[eps]
-        if not metrics_by_window:
-            continue
-        scale = 1.0 / eps if eps > 0 else float("inf")
-        for window in sorted(metrics_by_window.keys()):
-            summary = metrics_by_window[window].summary
-            print(
-                f"{eps:7.3f} | {window:6d} | {scale:5.2f} | {summary.train_count:5d} | {summary.test_count:4d} | "
-                f"{summary.rmse:8.3f} | {summary.mae:6.3f} | {summary.bias:6.3f} | {summary.r2:5.3f} | "
-                f"{summary.baseline_mean_rmse:8.3f} | {summary.baseline_locf_rmse:9.3f} | {summary.baseline_dp_rmse:8.3f}"
-            )
+
+    def _print_table(title: str, accessor) -> None:
+        print(f"\n{title}")
+        print(header)
+        printed = False
+        for eps in sorted(results.keys()):
+            metrics_by_window = results[eps]
+            if not metrics_by_window:
+                continue
+            scale = 1.0 / eps if eps > 0 else float("inf")
+            for window in sorted(metrics_by_window.keys()):
+                window_result = metrics_by_window[window]
+                summary = accessor(window_result)
+                if summary is None:
+                    continue
+                print(
+                    f"{eps:7.3f} | {window:6d} | {scale:5.2f} | {summary.train_count:5d} | {summary.test_count:4d} | "
+                    f"{summary.rmse:8.3f} | {summary.mae:6.3f} | {summary.bias:6.3f} | {summary.r2:5.3f} | "
+                    f"{summary.baseline_mean_rmse:8.3f} | {summary.baseline_locf_rmse:9.3f} | {summary.baseline_dp_rmse:8.3f}"
+                )
+                printed = True
+        if not printed:
+            print("  (no data)")
+
+    _print_table(
+        f"{variant} (with DP features)",
+        lambda wr: wr.summary,
+    )
+    _print_table(
+        f"{variant} (w/o DP features)",
+        lambda wr: wr.summary_nodp,
+    )
 
 
 def plot_single_hour_timelines(
@@ -852,7 +899,6 @@ def plot_single_hour_timelines(
         return
     try:
         import matplotlib.pyplot as plt
-        from matplotlib import cm
     except ImportError as exc:  # pragma: no cover - optional dependency
         if not getattr(plot_single_hour_timelines, "_warned", False):
             print(f"Matplotlib not available; skipping plots ({exc}).")
@@ -872,52 +918,182 @@ def plot_single_hour_timelines(
             continue
 
         windows = sorted(window_results.keys())
-        cmap = cm.get_cmap("tab10", len(windows))
-        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        base_colors = [
+            "#d62728",
+            "#2ca02c",
+            "#1f77b4",
+            "#ff7f0e",
+            "#9467bd",
+            "#8c564b",
+            "#e377c2",
+            "#7f7f7f",
+            "#bcbd22",
+            "#17becf",
+        ]
+        colors = [base_colors[idx % len(base_colors)] for idx in range(len(windows))]
+        dp_main_ls = "-"
+        nodp_main_ls = "--"
+        metric_styles_dp = {
+            "rmse": "-",
+            "mae": "-.",
+            "bias": ":",
+        }
+        metric_styles_nodp = {
+            "rmse": "--",
+            "mae": (0, (1, 1)),
+            "bias": (0, (2, 2)),
+        }
+        metric_markers_dp = {
+            "rmse": "o",
+            "mae": "s",
+            "bias": "x",
+        }
+        metric_markers_nodp = {
+            "rmse": "^",
+            "mae": "v",
+            "bias": "D",
+        }
+        marker_stride = max(1, len(time_axis) // 25)
+        fig, axes = plt.subplots(3, 1, figsize=(15, 8), sharex=True)
+        legend_kwargs = dict(loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8, borderaxespad=0.0)
 
         axes[0].step(time_axis, true_series, where="post", color="black", alpha=0.3, label="True count")
         for idx, window in enumerate(windows):
-            color = cmap(idx)
-            timeline = window_results[window].timeline
-            axes[0].plot(time_axis, timeline.avg_prediction, color=color, label=f"win={window}")
+            color = colors[idx]
+            wr = window_results[window]
+            axes[0].plot(
+                time_axis,
+                wr.timeline.avg_prediction,
+                color=color,
+                linestyle=dp_main_ls,
+                linewidth=2.0,
+                label=f"win={window} (with DP)",
+            )
+            if wr.timeline_nodp is not None:
+                axes[0].plot(
+                    time_axis,
+                    wr.timeline_nodp.avg_prediction,
+                    color=color,
+                    linestyle=nodp_main_ls,
+                    linewidth=2.0,
+                    label=f"win={window} (w/o DP)",
+                )
         axes[0].set_ylabel("Available spots")
         axes[0].set_ylim(-0.05 * max_available, max_available + 1)
         axes[0].set_title(f"Hour {hour} ε={eps:.3f} ({variant}, {subset_label})")
-        axes[0].legend(loc="upper right", fontsize=8)
+        axes[0].legend(**legend_kwargs)
 
         for idx, window in enumerate(windows):
-            color = cmap(idx)
-            timeline = window_results[window].timeline
-            axes[1].plot(time_axis, timeline.mean_absolute_error, color=color, label=f"win={window}")
+            color = colors[idx]
+            wr = window_results[window]
+            axes[1].plot(
+                time_axis,
+                wr.timeline.mean_absolute_error,
+                color=color,
+                linestyle=dp_main_ls,
+                linewidth=2.0,
+                label=f"win={window} (with DP)",
+            )
+            if wr.timeline_nodp is not None:
+                axes[1].plot(
+                    time_axis,
+                    wr.timeline_nodp.mean_absolute_error,
+                    color=color,
+                    linestyle=nodp_main_ls,
+                    linewidth=2.0,
+                    label=f"win={window} (w/o DP)",
+                )
         axes[1].set_ylabel("Mean abs error")
         axes[1].set_ylim(bottom=0)
+        axes[1].legend(**legend_kwargs)
 
         for idx, window in enumerate(windows):
-            color = cmap(idx)
-            timeline = window_results[window].timeline
-            axes[2].plot(time_axis, timeline.cumulative_rmse, color=color, label=f"rmse win={window}")
+            color = colors[idx]
+            wr = window_results[window]
             axes[2].plot(
                 time_axis,
-                timeline.cumulative_mae,
+                wr.timeline.cumulative_rmse,
                 color=color,
-                linestyle=":",
-                label=f"mae win={window}"
+                linestyle=metric_styles_dp["rmse"],
+                linewidth=2.0,
+                marker=metric_markers_dp["rmse"],
+                markevery=marker_stride,
+                markersize=5,
+                label=f"rmse win={window} (with DP)",
             )
             axes[2].plot(
                 time_axis,
-                timeline.cumulative_bias,
+                wr.timeline.cumulative_mae,
                 color=color,
-                linestyle="--",
-                label=f"bias win={window}"
+                linestyle=metric_styles_dp["mae"],
+                linewidth=2.0,
+                marker=metric_markers_dp["mae"],
+                markevery=marker_stride,
+                markersize=5,
+                label=f"mae win={window} (with DP)",
             )
+            axes[2].plot(
+                time_axis,
+                wr.timeline.cumulative_bias,
+                color=color,
+                linestyle=metric_styles_dp["bias"],
+                linewidth=2.0,
+                marker=metric_markers_dp["bias"],
+                markevery=marker_stride,
+                markersize=5,
+                label=f"bias win={window} (with DP)",
+            )
+            if wr.timeline_nodp is not None:
+                axes[2].plot(
+                    time_axis,
+                    wr.timeline_nodp.cumulative_rmse,
+                    color=color,
+                    linestyle=metric_styles_nodp["rmse"],
+                    linewidth=2.0,
+                    marker=metric_markers_nodp["rmse"],
+                    markevery=marker_stride,
+                    markersize=5,
+                    markerfacecolor="white",
+                    markeredgecolor=color,
+                    markeredgewidth=1.2,
+                    label=f"rmse win={window} (w/o DP)",
+                )
+                axes[2].plot(
+                    time_axis,
+                    wr.timeline_nodp.cumulative_mae,
+                    color=color,
+                    linestyle=metric_styles_nodp["mae"],
+                    linewidth=2.0,
+                    marker=metric_markers_nodp["mae"],
+                    markevery=marker_stride,
+                    markersize=5,
+                    markerfacecolor="white",
+                    markeredgecolor=color,
+                    markeredgewidth=1.2,
+                    label=f"mae win={window} (w/o DP)",
+                )
+                axes[2].plot(
+                    time_axis,
+                    wr.timeline_nodp.cumulative_bias,
+                    color=color,
+                    linestyle=metric_styles_nodp["bias"],
+                    linewidth=2.0,
+                    marker=metric_markers_nodp["bias"],
+                    markevery=marker_stride,
+                    markersize=5,
+                    markerfacecolor="white",
+                    markeredgecolor=color,
+                    markeredgewidth=1.2,
+                    label=f"bias win={window} (w/o DP)",
+                )
         axes[2].set_ylabel("Cum RMSE/MAE/Bias")
         axes[2].set_xlabel("Timestep")
-        axes[2].legend(loc="upper right", fontsize=8)
+        axes[2].legend(**legend_kwargs)
 
         for ax in axes:
             ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
 
-        fig.tight_layout()
+        fig.tight_layout(rect=(0.0, 0.0, 0.9, 1.0))
         variant_slug = variant.lower().replace(" ", "_")
         eps_slug = f"{eps:.3f}".replace("-", "m").replace(".", "p")
         filename = f"hour{hour}_eps{eps_slug}_{subset_slug}_{variant_slug}.png"
